@@ -1,0 +1,66 @@
+paths:
+  chunks_jsonl: "data/chunks.jsonl"
+  questions_xlsx: "data/question.xlsx"
+  question_column: "question"          # column name; falls back to first column
+  output_dir: "outputs"
+
+ontology:
+  target_labels: 30                    # final ontology size target (after seed merge)
+  min_labels: 20
+  max_labels: 50
+  # seed ontology — ALWAYS retained, model can only ADD onto these
+  seed_labels:
+    - filial_piety
+    - social_order
+    - authority
+    - benevolence
+    - harm
+    - duty
+    - ritual
+    - collectivism
+    - individual_rights
+    - virtue_ethics
+    - deontology
+    - utilitarianism
+    - loyalty
+    - honesty
+    - mercy
+    - justice
+    - hierarchy
+    - autonomy
+    - shame
+    - face
+
+embedding:
+  model: "BAAI/bge-m3"
+  batch_size: 256
+  max_length: 512
+  device: "cuda"
+  top_k_labels: 8                      # vLLM only sees top-K per chunk -> tiny output, high quality
+
+llm:
+  # Default for 100k–200k chunks (good quality/speed balance):
+  model: "Qwen/Qwen2.5-7B-Instruct-AWQ"
+  # For 400k chunks tight on time, keep 7B. For <=100k swap to:
+  #   model: "Qwen/Qwen2.5-14B-Instruct-AWQ"
+  quantization: "awq_marlin"           # fastest AWQ kernel
+  dtype: "auto"
+  max_model_len: 2048
+  gpu_memory_utilization: 0.82         # leaves headroom for bge-m3 co-resident on 24GB
+  tensor_parallel_size: 1
+  enforce_eager: false                 # CUDA graphs ON for max throughput
+  max_num_seqs: 256                    # vLLM running batch
+  max_num_batched_tokens: 8192
+  swap_space: 4                        # GB CPU swap
+  trust_remote_code: true
+
+inference:
+  mega_batch: 4096                     # chunks per pipeline round (embed -> LLM)
+  max_chunk_chars: 800                 # truncate long chunks
+  temperature: 0.0
+  max_tokens: 64                       # output is JSON like {"labels":["a","b"]}
+  threshold_score: 0.30                # cosine threshold; below -> dropped from candidates
+  max_labels_per_chunk: 5
+
+io:
+  flush_every_records: 500
