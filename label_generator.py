@@ -18,27 +18,39 @@ from utils import normalize_label
 
 
 PROMPT_LABEL_NAMING = """\
-You are an expert in ethics, philosophy, and Confucian / cross-cultural moral theory.
+You are an expert in ethics, philosophy, and cross-cultural moral theory.
 
 A cluster of user questions on moral / cultural dilemmas is given below.
-Your job: assign ONE canonical short label that captures the cluster's core ethical concept.
+Your job: assign ONE canonical short label that captures the SPECIFIC ethical concept
+of THIS cluster.
 
 Rules:
 - Output a single label only.
-- Format: snake_case English, 1 to 3 tokens (e.g. filial_piety, social_harmony, individual_rights).
-- Prefer abstract ethics / cultural concepts (filial_piety, loyalty, harm, autonomy, duty, virtue,
-  ritual, collectivism, hierarchy, mercy, justice, honesty, face, shame, utilitarianism).
-- Avoid trivial topic words (e.g. "money", "school", "friend").
-- If the cluster overlaps with one of the SEED LABELS, REUSE that seed label exactly.
+- Format: snake_case English, 1 to 3 tokens
+  (e.g. filial_piety, bodily_autonomy, work_ethic, vigilante_justice, moral_luck,
+   counterfactual_ethics, animal_welfare, addiction_recovery).
+- Be SPECIFIC. Pick the label that most narrowly captures the cluster's theme.
+  * cluster about skipping work / taking time off  -> work_ethic, not duty
+  * cluster about drug use / weed                 -> bodily_autonomy, not individual_rights
+  * cluster about time-travel / counterfactuals    -> moral_luck or counterfactual_ethics, not social_order
+  * cluster about giving away income to charity    -> charity or altruism, not duty
+- REUSE a SEED LABEL ONLY when it is a near-perfect semantic match for the cluster
+  as a whole. If only part of the cluster matches a seed, propose a NEW label that
+  fits the cluster better.
+- Forbidden behavior: do NOT default to `duty`, `harm`, `individual_rights`, or
+  `social_order` as catch-alls for clusters that have a more precise theme.
+- Avoid trivial topic words (e.g. "money", "school", "friend", "job").
+- Each cluster should ideally get a label different from neighboring clusters; if
+  multiple clusters share the SAME theme, only then reuse the same label.
 
-SEED LABELS:
+SEED LABELS (reuse only on near-perfect match; otherwise propose a NEW snake_case label):
 {seed_labels}
 
 CLUSTER QUESTIONS:
 {questions}
 
 Reply with JSON only, no prose:
-{{"label": "<snake_case_label>", "rationale": "<one short sentence>"}}"""
+{{"label": "<snake_case_label>", "rationale": "<one short sentence why this label fits the cluster>"}}"""
 
 
 LABEL_NAMING_SCHEMA = {
