@@ -19,7 +19,17 @@ mkdir -p outputs logs data
 
 STAGE="${1:-all}"
 
+# If download_models.sh has finished, run in offline mode so loaders don't
+# revisit the hub for optional files (e.g. bge-m3/imgs/) that may 403 on mirrors.
+# Override with `HF_HUB_OFFLINE=0 bash run.sh ...` if you really need network.
+if [[ -f "${HF_HOME}/.cache_ready" ]]; then
+  export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
+else
+  echo "[run] WARN: models cache sentinel not found. Run 'bash tools/download_models.sh' first for a stable offline run."
+fi
+
 echo "[run] HF_HOME=${HF_HOME}"
+echo "[run] HF_HUB_OFFLINE=${HF_HUB_OFFLINE:-0}"
 echo "[run] CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES}"
 echo "[run] stage=${STAGE}"
 

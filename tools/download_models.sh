@@ -35,8 +35,35 @@ if ! command -v huggingface-cli >/dev/null 2>&1; then
 fi
 
 # Pull each repo. HF_HOME redirects everything into ./models.
-hf download "${LLM_REPO}"
-hf download "${EMB_REPO}"
+# We use snapshot_download from python so we can pass `ignore_patterns` --
+# the hf-mirror sometimes 403s on docs/.DS_Store inside repos (e.g. bge-m3/imgs/).
+# AWQ and bge-m3 use *.safetensors, so we skip the *.bin variants to save ~2GB.
+export LLM_REPO EMB_REPO
+python - <<'PY'
+import os
+from huggingface_hub import snapshot_download
+
+llm_repo = os.environ["LLM_REPO"]
+emb_repo = os.environ["EMB_REPO"]
+
+print(f"[snapshot] {llm_repo}")
+snapshot_download(
+    repo_id=llm_repo,
+    ignore_patterns=["*.bin", "*.DS_Store", "imgs/*"],
+    max_workers=8,
+    resume_download=True,
+)
+print(f"[snapshot] {emb_repo}")
+snapshot_download(
+    repo_id=emb_repo,
+    ignore_patterns=["*.bin", "*.DS_Store", "imgs/*"],
+    max_workers=8,
+    resume_download=True,
+)
+PY
+
+# Sentinel so run.sh can know we finished and switch to offline mode safely.
+touch "${HF_HOME}/.cache_ready"
 
 echo
 echo "[download] done."
