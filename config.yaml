@@ -5,9 +5,9 @@ paths:
   output_dir: "outputs"
 
 ontology:
-  target_labels: 30                    # final ontology size target (after seed merge)
-  min_labels: 20
-  max_labels: 50
+  target_labels: 50                    # final ontology size target (after seed merge)
+  min_labels: 30
+  max_labels: 80
   # seed ontology — ALWAYS retained, model can only ADD onto these
   # NOTE: `other` is the mandatory fallback. Every chunk that matches no
   # ethics concept will be labeled "other" so it stays retrievable in RAG
@@ -37,7 +37,7 @@ ontology:
 
 embedding:
   model: "BAAI/bge-m3"
-  batch_size: 256
+  batch_size: 128                      # 256->128: halves bge-m3 peak memory
   max_length: 512
   device: "cuda"
   top_k_labels: 8                      # vLLM only sees top-K per chunk -> tiny output, high quality
@@ -50,7 +50,7 @@ llm:
   quantization: "awq_marlin"           # fastest AWQ kernel
   dtype: "auto"
   max_model_len: 2048
-  gpu_memory_utilization: 0.82         # leaves headroom for bge-m3 co-resident on 24GB
+  gpu_memory_utilization: 0.70         # leave ~6 GB for bge-m3 co-resident on 24 GB
   tensor_parallel_size: 1
   enforce_eager: false                 # CUDA graphs ON for max throughput
   max_num_seqs: 256                    # vLLM running batch

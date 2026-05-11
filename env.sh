@@ -26,6 +26,9 @@ export HF_ENDPOINT="https://hf-mirror.com"
 export VLLM_WORKER_MULTIPROC_METHOD=spawn
 export TOKENIZERS_PARALLELISM=false
 
+# Reduce PyTorch CUDA fragmentation -- helps when bge-m3 + vLLM co-resident on 24GB.
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+
 # Pin to GPU 0 by default; respect any externally-set value.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
