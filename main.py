@@ -48,11 +48,16 @@ def _ensure_other(ontology: dict, logger) -> None:
 
 def _label_texts_batch(
     texts: list, ontology: dict, embedder: EmbeddingFilter,
-    runner: VLLMRunner, cfg: dict,
+    runner: VLLMRunner, cfg: dict, mode: str = "chunk",
 ) -> list:
-    """One-shot multi-label classification on a small text list (questions or chunks).
-    Reuses the SAME prompt/schema/parser as Stage 2 -- ensures questions and chunks
-    are labeled under identical rules."""
+    """One-shot multi-label classification on a list of texts.
+
+    mode='chunk'    -> Stage 2 behavior. Schema enum includes `other`; empty
+                       parses fall back to ["other"].
+    mode='question' -> Stage 1 question-labeling. Schema enum EXCLUDES `other`
+                       (questions BUILT the ontology -> 'other' is a bug);
+                       empty parses fall back to bge-m3 top-1 candidate.
+    """
     if not texts:
         return []
     embedder.fit_labels(
@@ -60,11 +65,18 @@ def _label_texts_batch(
         [ontology["descriptions"].get(l, l.replace("_", " "))
          for l in ontology["labels"]],
     )
-    schema   = build_guided_schema(ontology["labels"], cfg["inference"]["max_labels_per_chunk"])
-    allowed  = set(ontology["labels"]) | {OTHER}
+
+    allow_other = (mode == "chunk")
+    max_lbl  = int(cfg["inference"]["max_labels_per_chunk"])
+    schema   = build_guided_schema(ontology["labels"], max_lbl, allow_other=allow_other)
+    allowed  = set(ontology["labels"])
+    if allow_other:
+        allowed.add(OTHER)
+    else:
+        allowed.discard(OTHER)
+
     top_k    = int(cfg["embedding"]["top_k_labels"])
     thresh   = float(cfg["inference"]["threshold_score"])
-    max_lbl  = int(cfg["inference"]["max_labels_per_chunk"])
     max_chr  = int(cfg["inference"]["max_chunk_chars"])
     max_out  = int(cfg["inference"]["max_tokens"])
 
@@ -77,11 +89,23 @@ def _label_texts_batch(
         if not cands:
             cands = ontology["labels"][:top_k]
         descs = {l: ontology["descriptions"].get(l, "") for l in cands}
-        prompts.append(build_prompt(t, cands, descs, max_chr))
+        prompts.append(build_prompt(t, cands, descs, max_chr, mode=mode))
     outs = runner.generate_text(
         prompts, max_tokens=max_out, temperature=0.0, guided_json=schema,
     )
-    return [parse_labels(o, allowed, max_lbl) for o in outs]
+
+    fallback = OTHER if allow_other else None
+    results = []
+    for out, (idxs, _scores) in zip(outs, topk):
+        labs = parse_labels(out, allowed, max_lbl, fallback=fallback)
+        if not labs:
+            # question mode + parse failure -> use bge-m3 top-1 as deterministic backup
+            if idxs:
+                labs = [ontology["labels"][idxs[0]]]
+            elif ontology["labels"]:
+                labs = [ontology["labels"][0]]
+        results.append(labs)
+    return results
 
 
 def _write_question_labels_xlsx(
@@ -92,7 +116,8 @@ def _write_question_labels_xlsx(
     sep: str = "|",
 ) -> int:
     """Re-read the source xlsx, add a `labels` column (pipe-separated), save to dst.
-    Rows whose question text is missing/blank get `other`. Returns row count."""
+    Blank/missing question cells get an empty labels cell (NOT `other`, because
+    `other` is reserved for chunks)."""
     import pandas as pd
     df = pd.read_excel(src_xlsx)
     col = question_column if question_column in df.columns else df.columns[0]
@@ -106,7 +131,8 @@ def _write_question_labels_xlsx(
             x = "" if x is None else str(x)
         labs = q2l.get(x.strip())
         if not labs:
-            labs = [OTHER]
+            # blank row or duplicate-but-different-whitespace -> leave empty
+            return ""
         return sep.join(labs)
 
     df[out_column] = df[col].apply(lookup)
@@ -160,18 +186,26 @@ def run_stage1(cfg: dict, logger, embedder: EmbeddingFilter,
 
     _ensure_other(ontology, logger)
 
-    # --- 2) question labeling ---
+    # --- 2) question labeling (mode='question': NO 'other' allowed -- every
+    # question must map to a real ontology concept because the ontology was
+    # BUILT from these questions; 'other' here would be a self-contradiction.
     if questions:
         t1 = time.time()
-        labels_per_q = _label_texts_batch(questions, ontology, embedder, runner, cfg)
-        n_other = sum(1 for ls in labels_per_q if ls == [OTHER])
+        labels_per_q = _label_texts_batch(
+            questions, ontology, embedder, runner, cfg, mode="question",
+        )
+        # Quick health check: count multi-label questions and average label count
+        n_multi = sum(1 for ls in labels_per_q if len(ls) >= 2)
+        avg_labels = (sum(len(ls) for ls in labels_per_q) / len(labels_per_q)
+                      if labels_per_q else 0.0)
         n_rows = _write_question_labels_xlsx(
             src_xlsx, labeled_xlsx, questions, labels_per_q,
             question_column=qcol,
         )
         logger.info(
             f"[stage1] question labels -> {labeled_xlsx} "
-            f"(rows={n_rows}, unique_q={len(questions)}, other={n_other}/{len(questions)}, "
+            f"(rows={n_rows}, unique_q={len(questions)}, "
+            f"multi_label={n_multi}/{len(questions)}, avg_labels={avg_labels:.2f}, "
             f"took {time.time()-t1:.1f}s)"
         )
 
