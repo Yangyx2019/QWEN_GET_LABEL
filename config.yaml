@@ -9,6 +9,9 @@ ontology:
   min_labels: 20
   max_labels: 50
   # seed ontology — ALWAYS retained, model can only ADD onto these
+  # NOTE: `other` is the mandatory fallback. Every chunk that matches no
+  # ethics concept will be labeled "other" so it stays retrievable in RAG
+  # (instead of getting [] which is unfilterable).
   seed_labels:
     - filial_piety
     - social_order
@@ -30,6 +33,7 @@ ontology:
     - autonomy
     - shame
     - face
+    - other
 
 embedding:
   model: "BAAI/bge-m3"

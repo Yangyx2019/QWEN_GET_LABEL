@@ -28,7 +28,7 @@ from utils import setup_logger, dump_json, free_memory
 from embedding_filter import EmbeddingFilter
 from llm_engine import VLLMRunner
 from label_generator import build_ontology, LABEL_NAMING_SCHEMA
-from chunk_labeler import build_guided_schema, build_prompt, parse_labels
+from chunk_labeler import build_guided_schema, build_prompt, parse_labels, OTHER
 
 
 # ============ stage 1 ============
@@ -88,6 +88,18 @@ def run_stage2(cfg: dict, logger, ontology: dict,
 
     if not os.path.exists(chunks_path):
         raise FileNotFoundError(f"chunks file not found: {chunks_path}")
+
+    # Backward-compat: ensure the `other` fallback label is in the ontology.
+    # Old ontology.json files (pre-`other`) get migrated in-memory; new runs
+    # already include it via config.seed_labels.
+    if OTHER not in ontology["labels"]:
+        ontology["labels"].append(OTHER)
+        logger.info(f"[stage2] injected fallback label `{OTHER}` (not in ontology.json)")
+    ontology.setdefault("descriptions", {})
+    if not ontology["descriptions"].get(OTHER):
+        ontology["descriptions"][OTHER] = (
+            "USE ALONE: chunk is not related to any listed ethics or cultural concept"
+        )
 
     # --- prepare embedder side: label matrix
     embedder.fit_labels(
@@ -195,12 +207,16 @@ def run_stage2(cfg: dict, logger, ontology: dict,
         "ontology_size": len(ontology["labels"]),
         "elapsed_seconds": round(elapsed, 1),
         "chunks_per_second": round(rate, 2),
+        # how much of the corpus the ontology FAILED to cover -- the lower the better
+        "other_count": label_counts.get(OTHER, 0),
+        "other_rate": round(label_counts.get(OTHER, 0) / max(n_done, 1), 4),
         "label_distribution": dict(
             sorted(label_counts.items(), key=lambda kv: -kv[1])
         ),
     }
     dump_json(stats_path, stats)
-    logger.info(f"[stage2] stats -> {stats_path}")
+    logger.info(f"[stage2] stats -> {stats_path}  "
+                f"(other={stats['other_count']} / {n_done} = {stats['other_rate']:.1%})")
 
 
 # ============ entry ============

@@ -138,6 +138,10 @@ def build_label_descriptions(
         by_label.setdefault(lbl, []).extend(reps.get(c, [])[:3])
     out: Dict[str, str] = {}
     for lbl in ontology:
+        if lbl == "other":
+            # mandatory fallback: never embed-rank-friendly; described purely by purpose
+            out[lbl] = "USE ALONE: chunk is not related to any listed ethics or cultural concept"
+            continue
         examples = by_label.get(lbl, [])
         if examples:
             # join up to 3 short example questions
