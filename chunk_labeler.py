@@ -46,6 +46,9 @@ def build_guided_schema(ontology_labels: List[str], max_labels: int) -> dict:
 
     minItems=1 forces the model to pick something — if nothing fits, the prompt
     tells it to pick `other`.
+
+    NOTE: `uniqueItems` is intentionally NOT used here — xgrammar / guidance
+    backends in vLLM ≥0.20 don't implement it. Dedup is handled in parse_labels.
     """
     labels = list(ontology_labels)
     if OTHER not in labels:
@@ -57,7 +60,6 @@ def build_guided_schema(ontology_labels: List[str], max_labels: int) -> dict:
                 "type": "array",
                 "minItems": 1,
                 "maxItems": int(max_labels),
-                "uniqueItems": True,
                 "items": {"type": "string", "enum": labels},
             }
         },
