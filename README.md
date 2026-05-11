@@ -13,6 +13,7 @@ Local two-stage labeling pipeline for cultural / ethics RAG experiments.
 ```
 qwen_get_label/
 ├── config.yaml             # single source of truth for tuning
+├── env.sh                  # HF cache + runtime envs (sourced by every script)
 ├── requirements.txt
 ├── run.sh                  # one-shot launcher
 ├── main.py                 # pipeline driver: stage1 / stage2 / all
@@ -22,10 +23,13 @@ qwen_get_label/
 ├── llm_engine.py           # vLLM wrapper (chat template + guided_json + xgrammar)
 ├── label_generator.py      # Stage 1
 ├── chunk_labeler.py        # Stage 2 (prompt / schema / parse)
-├── tools/make_demo.py      # smoke-test data generator
+├── tools/
+│   ├── make_demo.py            # smoke-test data generator
+│   └── download_models.sh      # pre-fetch LLM + bge-m3 into ./models/
 ├── data/
 │   ├── chunks.jsonl        # YOUR INPUT
 │   └── question.xlsx       # YOUR INPUT
+├── models/                 # auto-created; project-local HF cache (HF_HOME)
 └── outputs/                # all artifacts land here
     ├── ontology.json
     ├── chunk_labels.jsonl
@@ -49,47 +53,45 @@ Key deps: `vllm>=0.6.6`, `xgrammar`, `FlagEmbedding`, `transformers`, `pandas`, 
 
 ---
 
-## 2) Models — **no manual download required, but pre-fetch is recommended**
+## 2) Models — cached **inside the project**, no manual download required
 
-vLLM and `FlagEmbedding` auto-download on first use. The pipeline launches will hang on network during cold start; pre-fetching avoids interrupting your 1–3 h job.
+All HF cache paths are pinned to `$PROJECT_ROOT/models/` via [env.sh](env.sh), which is sourced by both [run.sh](run.sh) and [tools/download_models.sh](tools/download_models.sh). Auto-download on first run works out of the box; pre-fetching just saves you from a network hiccup mid-pipeline.
+
+Resulting layout:
+
+```
+qwen_get_label/
+└── models/                                          <-- HF_HOME
+    └── hub/
+        ├── models--Qwen--Qwen2.5-7B-Instruct-AWQ/
+        └── models--BAAI--bge-m3/
+```
 
 Cache sizes:
 
-| model                              | size    | role         |
-| ---------------------------------- | ------- | ------------ |
-| `Qwen/Qwen2.5-7B-Instruct-AWQ`     | ~5 GB   | LLM (default)|
+| model                              | size    | role                         |
+| ---------------------------------- | ------- | ---------------------------- |
+| `Qwen/Qwen2.5-7B-Instruct-AWQ`     | ~5 GB   | LLM (default)                |
 | `Qwen/Qwen2.5-14B-Instruct-AWQ`    | ~8 GB   | LLM (higher quality, slower) |
-| `BAAI/bge-m3`                      | ~2.2 GB | embedding    |
+| `BAAI/bge-m3`                      | ~2.2 GB | embedding                    |
 
-Pre-fetch:
-
-```bash
-pip install -U "huggingface_hub[cli]"
-
-# default (recommended)
-huggingface-cli download Qwen/Qwen2.5-7B-Instruct-AWQ
-huggingface-cli download BAAI/bge-m3
-
-# alt: higher quality LLM
-huggingface-cli download Qwen/Qwen2.5-14B-Instruct-AWQ
-```
-
-China mirror (if HF Hub is slow):
+**Pre-fetch (recommended):**
 
 ```bash
-export HF_ENDPOINT=https://hf-mirror.com
-huggingface-cli download Qwen/Qwen2.5-7B-Instruct-AWQ
-huggingface-cli download BAAI/bge-m3
+bash tools/download_models.sh         # 7B + bge-m3, ~7 GB
+bash tools/download_models.sh 14b     # 14B + bge-m3, ~10 GB
 ```
 
-Custom cache location:
+After this, `bash run.sh` finds everything locally and never touches the network.
 
+**China mirror** — uncomment the `HF_ENDPOINT` line in [env.sh](env.sh):
 ```bash
-export HF_HOME=/data/hf_cache
-export HF_HUB_CACHE=/data/hf_cache/hub
+export HF_ENDPOINT="https://hf-mirror.com"
 ```
 
-To switch model, edit `llm.model` in [config.yaml](config.yaml).
+**Custom location** — edit `HF_HOME` in [env.sh](env.sh) to any absolute path (e.g. `/data/hf_cache`). Both run and download scripts will follow it.
+
+**Switch LLM** — edit `llm.model` in [config.yaml](config.yaml).
 
 ---
 
