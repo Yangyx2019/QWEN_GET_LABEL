@@ -29,30 +29,60 @@ def _detect_engine_kwargs() -> Optional[set]:
         return None
 
 
-def _detect_structured_outputs_api():
-    """Returns (Cls, sp_field_name) tuple — Cls is the params class, sp_field_name
-    is the SamplingParams kwarg used to attach it.
+def _try_import(module_paths, class_name):
+    """Try to import `class_name` from each module path in order. Return the class
+    or None. Used to locate vLLM classes that move between releases."""
+    for mod_path in module_paths:
+        try:
+            mod = __import__(mod_path, fromlist=[class_name])
+            cls = getattr(mod, class_name, None)
+            if cls is not None:
+                return cls
+        except ImportError:
+            continue
+    return None
 
-    New API  (vLLM ≥0.10): (StructuredOutputsParams, "structured_outputs")
-    Old API  (vLLM <0.10):  (GuidedDecodingParams,    "guided_decoding")
+
+def _detect_structured_outputs_api():
+    """Probe-based detection: try constructing SamplingParams with each known API
+    until one works. Robust to Pydantic-style SamplingParams (vLLM ≥0.20) where
+    inspect.signature doesn't enumerate fields.
+
+    Returns (Cls, sp_field_name) — pass `Cls(json=schema)` as `sp_field_name=` to
+    SamplingParams. Returns (None, None) if no API is available.
     """
     from vllm import SamplingParams
-    sp_params = set(inspect.signature(SamplingParams.__init__).parameters.keys())
+    dummy_schema = {"type": "object", "properties": {}, "required": []}
 
-    # Prefer new API if both class + SP field exist.
-    try:
-        from vllm.sampling_params import StructuredOutputsParams
-        if "structured_outputs" in sp_params:
+    # Try new API first (vLLM ≥0.10/0.20): StructuredOutputsParams + structured_outputs
+    StructuredOutputsParams = _try_import(
+        [
+            "vllm.sampling_params",
+            "vllm",
+            "vllm.v1.sampling_params",
+            "vllm.v1.structured_output",
+        ],
+        "StructuredOutputsParams",
+    )
+    if StructuredOutputsParams is not None:
+        try:
+            sop = StructuredOutputsParams(json=dummy_schema)
+            SamplingParams(structured_outputs=sop, max_tokens=1)
             return (StructuredOutputsParams, "structured_outputs")
-    except ImportError:
-        pass
+        except Exception as e:
+            print(f"[vllm-runner] StructuredOutputsParams probe failed: {type(e).__name__}: {e}")
 
-    try:
-        from vllm.sampling_params import GuidedDecodingParams
-        if "guided_decoding" in sp_params:
+    # Try old API (vLLM <0.10): GuidedDecodingParams + guided_decoding
+    GuidedDecodingParams = _try_import(
+        ["vllm.sampling_params", "vllm"], "GuidedDecodingParams",
+    )
+    if GuidedDecodingParams is not None:
+        try:
+            gdp = GuidedDecodingParams(json=dummy_schema)
+            SamplingParams(guided_decoding=gdp, max_tokens=1)
             return (GuidedDecodingParams, "guided_decoding")
-    except ImportError:
-        pass
+        except Exception as e:
+            print(f"[vllm-runner] GuidedDecodingParams probe failed: {type(e).__name__}: {e}")
 
     return (None, None)
 
@@ -102,6 +132,9 @@ class VLLMRunner:
         if self._SOP is None:
             print("[vllm-runner] WARN: no structured-outputs API detected; "
                   "guided_json will be ignored.")
+        else:
+            print(f"[vllm-runner] structured outputs: "
+                  f"SamplingParams(... {self._SO_FIELD}={self._SOP.__name__}(json=...))")
 
     def _apply_template(self, prompt: str) -> str:
         return self.tokenizer.apply_chat_template(
