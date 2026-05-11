@@ -2,14 +2,15 @@
 
 Usage:
     python main.py --config config.yaml --stage all     # stage1 + stage2
-    python main.py --config config.yaml --stage stage1  # ontology only
-    python main.py --config config.yaml --stage stage2  # labeling only
+    python main.py --config config.yaml --stage stage1  # ontology + question labels
+    python main.py --config config.yaml --stage stage2  # chunk labeling only
 
 Output files (under cfg.paths.output_dir):
-    ontology.json        : {"labels": [...], "descriptions": {...}, ...}
-    chunk_labels.jsonl   : one JSON per line {"chunk_id": "...", "labels": [...]}
-    stats.json           : counts + label distribution
-    failed_chunks.jsonl  : any chunks that errored out
+    ontology.json           : {"labels": [...], "descriptions": {...}, ...}
+    question_labeled.xlsx   : input xlsx + a `labels` column (pipe-separated)
+    chunk_labels.jsonl      : one JSON per line {"chunk_id": "...", "labels": [...]}
+    stats.json              : counts + label distribution
+    failed_chunks.jsonl     : any chunks that errored out
 """
 from __future__ import annotations
 import argparse
@@ -33,47 +34,148 @@ from chunk_labeler import build_guided_schema, build_prompt, parse_labels, OTHER
 
 # ============ stage 1 ============
 
-def run_stage1(cfg: dict, logger, embedder: EmbeddingFilter,
-               runner: VLLMRunner) -> dict:
-    """Build ontology from questions. Returns ontology dict and persists to disk."""
-    onto_path = os.path.join(cfg["paths"]["output_dir"], "ontology.json")
-    if os.path.exists(onto_path):
-        logger.info(f"[stage1] ontology already exists at {onto_path}; loading.")
-        return load_ontology(onto_path)
-
-    questions = load_questions(
-        cfg["paths"]["questions_xlsx"],
-        cfg["paths"].get("question_column", "question"),
-    )
-    logger.info(f"[stage1] loaded {len(questions)} questions")
-    if not questions:
-        logger.warning("[stage1] no questions found; ontology = seed labels only")
-
-    def embed_fn(texts):
-        return embedder.encode_texts(texts)
-
-    def llm_gen(prompts):
-        return runner.generate_text(
-            prompts,
-            max_tokens=80,
-            temperature=0.0,
-            guided_json=LABEL_NAMING_SCHEMA,
+def _ensure_other(ontology: dict, logger) -> None:
+    """In-memory migration: old ontology.json may lack 'other'. Add it on load."""
+    if OTHER not in ontology["labels"]:
+        ontology["labels"].append(OTHER)
+        logger.info(f"[stage1] injected fallback label `{OTHER}`")
+    ontology.setdefault("descriptions", {})
+    if not ontology["descriptions"].get(OTHER):
+        ontology["descriptions"][OTHER] = (
+            "USE ALONE: chunk is not related to any listed ethics or cultural concept"
         )
 
-    t0 = time.time()
-    onto = build_ontology(
-        questions=questions,
-        seeds=cfg["ontology"]["seed_labels"],
-        embed_fn=embed_fn,
-        llm_generate=llm_gen,
-        target_labels=cfg["ontology"]["target_labels"],
-        min_labels=cfg["ontology"]["min_labels"],
-        max_labels=cfg["ontology"]["max_labels"],
+
+def _label_texts_batch(
+    texts: list, ontology: dict, embedder: EmbeddingFilter,
+    runner: VLLMRunner, cfg: dict,
+) -> list:
+    """One-shot multi-label classification on a small text list (questions or chunks).
+    Reuses the SAME prompt/schema/parser as Stage 2 -- ensures questions and chunks
+    are labeled under identical rules."""
+    if not texts:
+        return []
+    embedder.fit_labels(
+        ontology["labels"],
+        [ontology["descriptions"].get(l, l.replace("_", " "))
+         for l in ontology["labels"]],
     )
-    dump_json(onto_path, onto)
-    logger.info(f"[stage1] ontology -> {onto_path} "
-                f"(n={len(onto['labels'])}, took {time.time()-t0:.1f}s)")
-    return onto
+    schema   = build_guided_schema(ontology["labels"], cfg["inference"]["max_labels_per_chunk"])
+    allowed  = set(ontology["labels"]) | {OTHER}
+    top_k    = int(cfg["embedding"]["top_k_labels"])
+    thresh   = float(cfg["inference"]["threshold_score"])
+    max_lbl  = int(cfg["inference"]["max_labels_per_chunk"])
+    max_chr  = int(cfg["inference"]["max_chunk_chars"])
+    max_out  = int(cfg["inference"]["max_tokens"])
+
+    topk = embedder.topk_for_texts(
+        [t[:max_chr] for t in texts], k=top_k, threshold=thresh,
+    )
+    prompts = []
+    for t, (idxs, _scores) in zip(texts, topk):
+        cands = [ontology["labels"][i] for i in idxs]
+        if not cands:
+            cands = ontology["labels"][:top_k]
+        descs = {l: ontology["descriptions"].get(l, "") for l in cands}
+        prompts.append(build_prompt(t, cands, descs, max_chr))
+    outs = runner.generate_text(
+        prompts, max_tokens=max_out, temperature=0.0, guided_json=schema,
+    )
+    return [parse_labels(o, allowed, max_lbl) for o in outs]
+
+
+def _write_question_labels_xlsx(
+    src_xlsx: str, dst_xlsx: str,
+    questions: list, labels_per_question: list,
+    question_column: str = "question",
+    out_column: str = "labels",
+    sep: str = "|",
+) -> int:
+    """Re-read the source xlsx, add a `labels` column (pipe-separated), save to dst.
+    Rows whose question text is missing/blank get `other`. Returns row count."""
+    import pandas as pd
+    df = pd.read_excel(src_xlsx)
+    col = question_column if question_column in df.columns else df.columns[0]
+    q2l = {q.strip(): labs for q, labs in zip(questions, labels_per_question)}
+    # if a labels column already exists, drop it -- we are the authoritative source
+    if out_column in df.columns:
+        df = df.drop(columns=[out_column])
+
+    def lookup(x):
+        if not isinstance(x, str):
+            x = "" if x is None else str(x)
+        labs = q2l.get(x.strip())
+        if not labs:
+            labs = [OTHER]
+        return sep.join(labs)
+
+    df[out_column] = df[col].apply(lookup)
+    os.makedirs(os.path.dirname(dst_xlsx) or ".", exist_ok=True)
+    df.to_excel(dst_xlsx, index=False)
+    return len(df)
+
+
+def run_stage1(cfg: dict, logger, embedder: EmbeddingFilter,
+               runner: VLLMRunner) -> dict:
+    """1) build ontology from questions  2) label every question with that ontology."""
+    out_dir       = cfg["paths"]["output_dir"]
+    onto_path     = os.path.join(out_dir, "ontology.json")
+    src_xlsx      = cfg["paths"]["questions_xlsx"]
+    qcol          = cfg["paths"].get("question_column", "question")
+    labeled_xlsx  = os.path.join(out_dir, "question_labeled.xlsx")
+
+    questions = load_questions(src_xlsx, qcol)
+    logger.info(f"[stage1] loaded {len(questions)} questions from {src_xlsx}")
+
+    # --- 1) ontology ---
+    if os.path.exists(onto_path):
+        logger.info(f"[stage1] ontology already exists at {onto_path}; loading.")
+        ontology = load_ontology(onto_path)
+    else:
+        if not questions:
+            logger.warning("[stage1] no questions found; ontology = seed labels only")
+
+        def embed_fn(texts):
+            return embedder.encode_texts(texts)
+
+        def llm_gen(prompts):
+            return runner.generate_text(
+                prompts, max_tokens=80, temperature=0.0,
+                guided_json=LABEL_NAMING_SCHEMA,
+            )
+
+        t0 = time.time()
+        ontology = build_ontology(
+            questions=questions,
+            seeds=cfg["ontology"]["seed_labels"],
+            embed_fn=embed_fn,
+            llm_generate=llm_gen,
+            target_labels=cfg["ontology"]["target_labels"],
+            min_labels=cfg["ontology"]["min_labels"],
+            max_labels=cfg["ontology"]["max_labels"],
+        )
+        dump_json(onto_path, ontology)
+        logger.info(f"[stage1] ontology -> {onto_path} "
+                    f"(n={len(ontology['labels'])}, took {time.time()-t0:.1f}s)")
+
+    _ensure_other(ontology, logger)
+
+    # --- 2) question labeling ---
+    if questions:
+        t1 = time.time()
+        labels_per_q = _label_texts_batch(questions, ontology, embedder, runner, cfg)
+        n_other = sum(1 for ls in labels_per_q if ls == [OTHER])
+        n_rows = _write_question_labels_xlsx(
+            src_xlsx, labeled_xlsx, questions, labels_per_q,
+            question_column=qcol,
+        )
+        logger.info(
+            f"[stage1] question labels -> {labeled_xlsx} "
+            f"(rows={n_rows}, unique_q={len(questions)}, other={n_other}/{len(questions)}, "
+            f"took {time.time()-t1:.1f}s)"
+        )
+
+    return ontology
 
 
 # ============ stage 2 ============
