@@ -35,8 +35,8 @@ if ! command -v huggingface-cli >/dev/null 2>&1; then
 fi
 
 # Pull each repo. HF_HOME redirects everything into ./models.
-huggingface-cli download "${LLM_REPO}"
-huggingface-cli download "${EMB_REPO}"
+hf download "${LLM_REPO}"
+hf download "${EMB_REPO}"
 
 echo
 echo "[download] done."
