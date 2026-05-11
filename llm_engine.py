@@ -1,47 +1,63 @@
-"""Thin vLLM wrapper:
-- single LLM engine, internal continuous batching
-- chat template applied via tokenizer
-- optional global guided_json schema (xgrammar backend, compiled once + cached)
+"""Thin vLLM wrapper, tolerant to vLLM 0.6 ↔ 0.20+ API churn.
 
-Tolerant to vLLM API churn:
-  * `guided_decoding_backend` kwarg was removed from EngineArgs in vLLM ≥0.8.
-    xgrammar is the default backend now; we just stop passing the kwarg.
-  * `GuidedDecodingParams` import path varies between releases — we try the new
-    location first, then fall back.
+Two breaking changes we adapt around:
+
+1) `guided_decoding_backend` was removed from `EngineArgs` in vLLM ≥0.10.
+   xgrammar is the default backend; we just drop the kwarg on newer installs.
+2) `GuidedDecodingParams` was renamed to `StructuredOutputsParams`, and
+   `SamplingParams.guided_decoding` → `SamplingParams.structured_outputs`
+   (vLLM ≥0.10). We detect which API is available and use it.
 """
 from __future__ import annotations
 import inspect
 from typing import List, Optional
 
 
-def _filter_supported(cls, kwargs: dict) -> dict:
-    """Drop kwargs that the installed vLLM no longer accepts."""
+# ---------- vLLM API detection ----------
+
+def _detect_engine_kwargs() -> Optional[set]:
+    """Return the set of EngineArgs field names, or None if introspection fails.
+    Used to drop unknown kwargs (e.g. `guided_decoding_backend` on vLLM ≥0.10)."""
     try:
-        sig = inspect.signature(cls.__init__)
-        allowed = set(sig.parameters.keys())
-        if "kwargs" in allowed or "args" in allowed:
-            return kwargs
-        return {k: v for k, v in kwargs.items() if k in allowed}
-    except (TypeError, ValueError):
-        return kwargs
+        from vllm.engine.arg_utils import EngineArgs
+        import dataclasses
+        if dataclasses.is_dataclass(EngineArgs):
+            return {f.name for f in dataclasses.fields(EngineArgs)}
+        sig = inspect.signature(EngineArgs.__init__)
+        return set(sig.parameters.keys())
+    except Exception:
+        return None
 
 
-def _import_guided_decoding_params():
-    """vLLM moved the class around across versions; try in priority order."""
-    last_err = None
-    for path in (
-        ("vllm.sampling_params", "GuidedDecodingParams"),
-        ("vllm",                 "GuidedDecodingParams"),
-    ):
-        try:
-            mod = __import__(path[0], fromlist=[path[1]])
-            return getattr(mod, path[1])
-        except (ImportError, AttributeError) as e:
-            last_err = e
-    raise ImportError(
-        f"Could not import GuidedDecodingParams from any known location: {last_err}"
-    )
+def _detect_structured_outputs_api():
+    """Returns (Cls, sp_field_name) tuple — Cls is the params class, sp_field_name
+    is the SamplingParams kwarg used to attach it.
 
+    New API  (vLLM ≥0.10): (StructuredOutputsParams, "structured_outputs")
+    Old API  (vLLM <0.10):  (GuidedDecodingParams,    "guided_decoding")
+    """
+    from vllm import SamplingParams
+    sp_params = set(inspect.signature(SamplingParams.__init__).parameters.keys())
+
+    # Prefer new API if both class + SP field exist.
+    try:
+        from vllm.sampling_params import StructuredOutputsParams
+        if "structured_outputs" in sp_params:
+            return (StructuredOutputsParams, "structured_outputs")
+    except ImportError:
+        pass
+
+    try:
+        from vllm.sampling_params import GuidedDecodingParams
+        if "guided_decoding" in sp_params:
+            return (GuidedDecodingParams, "guided_decoding")
+    except ImportError:
+        pass
+
+    return (None, None)
+
+
+# ---------- runner ----------
 
 class VLLMRunner:
     def __init__(self, cfg: dict):
@@ -56,7 +72,6 @@ class VLLMRunner:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
-        # Build LLM kwargs, then drop anything the installed vLLM doesn't accept.
         wanted = dict(
             model=self.model_name,
             quantization=llm_cfg.get("quantization"),
@@ -69,16 +84,24 @@ class VLLMRunner:
             max_num_batched_tokens=llm_cfg.get("max_num_batched_tokens", 8192),
             swap_space=llm_cfg.get("swap_space", 4),
             trust_remote_code=llm_cfg.get("trust_remote_code", True),
-            # NOTE: removed in vLLM ≥0.8 (xgrammar is the default). _filter_supported
-            # drops it on newer installs; older installs still pick it up.
-            guided_decoding_backend="xgrammar",
             disable_log_stats=True,
         )
-        wanted = _filter_supported(LLM, wanted)
+
+        # Drop any kwarg the installed EngineArgs no longer accepts.
+        engine_kwargs = _detect_engine_kwargs()
+        if engine_kwargs is not None:
+            dropped = {k for k in wanted if k not in engine_kwargs}
+            if dropped:
+                print(f"[vllm-runner] dropping unsupported kwargs: {sorted(dropped)}")
+            wanted = {k: v for k, v in wanted.items() if k in engine_kwargs}
+
         self.llm = LLM(**wanted)
 
-        # Resolve the GuidedDecodingParams class once.
-        self._GuidedDecodingParams = _import_guided_decoding_params()
+        # Pick structured-outputs API for this vLLM version.
+        self._SOP, self._SO_FIELD = _detect_structured_outputs_api()
+        if self._SOP is None:
+            print("[vllm-runner] WARN: no structured-outputs API detected; "
+                  "guided_json will be ignored.")
 
     def _apply_template(self, prompt: str) -> str:
         return self.tokenizer.apply_chat_template(
@@ -98,17 +121,18 @@ class VLLMRunner:
             return []
         from vllm import SamplingParams
 
-        gdp = self._GuidedDecodingParams(json=guided_json) if guided_json else None
-        sp = SamplingParams(
+        sp_kwargs = dict(
             temperature=temperature,
             top_p=1.0,
             max_tokens=max_tokens,
-            guided_decoding=gdp,
             stop=None,
         )
+        if guided_json is not None and self._SOP is not None:
+            sp_kwargs[self._SO_FIELD] = self._SOP(json=guided_json)
+
+        sp = SamplingParams(**sp_kwargs)
         templated = [self._apply_template(p) for p in prompts]
         outputs = self.llm.generate(templated, sp, use_tqdm=False)
-        # vLLM returns in the SAME order as inputs.
         return [o.outputs[0].text for o in outputs]
 
     def shutdown(self) -> None:
