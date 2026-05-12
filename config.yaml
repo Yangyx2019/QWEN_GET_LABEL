@@ -13,9 +13,14 @@ paths:
   output_dir: "outputs"
 
 ontology:
-  target_labels: 50                    # final ontology size target (after seed merge)
-  min_labels: 30
-  max_labels: 80
+  # With ~500 open-ended questions across 4 traditions (儒家/道家/斯多葛/存在主义),
+  # 50 labels collapses too much nuance. Raised to 100 / 200; the hard ceiling is
+  # `len(questions)//2` in code (so ~253 with 507 questions) to avoid singleton
+  # clusters dominating. xgrammar / top-K=8 handle 200 enum values comfortably —
+  # throughput impact at this scale is negligible (prefill, not enum size, dominates).
+  target_labels: 100                   # final ontology size target (after seed merge)
+  min_labels: 60
+  max_labels: 200
   # seed ontology — ALWAYS retained, model can only ADD onto these
   # NOTE: `other` is the mandatory fallback. Every chunk that matches no
   # ethics concept will be labeled "other" so it stays retrievable in RAG
@@ -42,6 +47,36 @@ ontology:
     - shame
     - face
     - other
+
+  # Cross-tradition concept definitions for seed labels.
+  # The corpus mixes 儒家 / 道家 / 斯多葛 / 存在主义 — so descriptions stay
+  # ABSTRACT and inclusive, not bound to one tradition's vocabulary or to the
+  # specific example sentences carried in from the English question clusters.
+  # Used BOTH by bge-m3 (as the label embedding text) AND by the LLM prompt
+  # (as the concept gloss). Custom LLM-named labels keep their cluster-rep
+  # descriptions; only seed labels are overridden here.
+  seed_descriptions:
+    filial_piety: "Reverence, obedience, and care toward parents, elders, and ancestors; intergenerational obligation; what one owes those who gave one life or upbringing."
+    social_order: "Maintenance of stable social structure, public peace, customs, or law; the harmony of community against disorder; rules that bind a polity together."
+    authority: "Legitimacy and exercise of power by rulers, institutions, teachers, or experts; the moral question of when to obey, defer to, critique, or resist those in command."
+    benevolence: "Active kindness, compassion, generosity, or care toward others; loving concern for human (or wider) wellbeing; the disposition to do good for its own sake."
+    harm: "Causing, risking, allowing, or refusing to prevent injury, suffering, damage, or loss to persons, groups, or beings; the moral weight of inflicted pain."
+    duty: "Obligation grounded in role, promise, principle, or station; what one is morally required to do regardless of personal preference or expected outcome."
+    ritual: "Formalized, repeated, meaningful practices — rites, ceremonies, etiquette, propriety, offerings to ancestors or the divine; the moral life expressed through proper form."
+    collectivism: "Priority of group, family, lineage, or community over individual aims; identity and obligation defined through belonging; shared interest over private interest."
+    individual_rights: "Personal liberties and entitlements held by the individual against others, the community, or the state; protections of person, property, conscience, expression, or choice."
+    virtue_ethics: "Moral life centered on character traits — wisdom, courage, humanity, justice, integrity, temperance — cultivated through practice and example; being a good person rather than merely following rules or maximizing outcomes."
+    deontology: "Morality grounded in rules, principles, or duties that hold regardless of consequences; right action defined by intrinsic features of the act, not its results."
+    utilitarianism: "Morality judged by consequences — happiness, welfare, suffering averted; greatest good for the greatest number; weighing and trading off outcomes."
+    loyalty: "Fidelity and commitment to a person, cause, principle, organization, lineage, or way of life; standing by one's allegiances under cost, temptation, or pressure."
+    honesty: "Truthfulness in speech and action; transparency, sincerity, integrity; refusal to deceive, conceal, or mislead — and the conflicts that follow when truth wounds."
+    mercy: "Forgiveness, leniency, or release from deserved punishment; compassionate restraint of justified harm; pardon."
+    justice: "Fair allocation of benefits, burdens, rights, and punishments; what each person is due; impartiality before rule, law, or principle."
+    hierarchy: "Ordered ranks of status, role, or power — between rulers and ruled, elders and juniors, teachers and students, master and disciple; the moral structure of vertical relations."
+    autonomy: "Self-governance, freedom from external control, capacity to choose one's own ends and values; living by one's own judgment rather than convention, custom, or coercion."
+    shame: "Painful awareness of having fallen short of moral, social, or self-ideals; loss of standing in one's own or others' eyes; remorseful conscience and the desire to hide."
+    face: "Public moral reputation, dignity, or honor in the eyes of others; what one risks losing or saving through visible conduct; the social register of esteem."
+    other: "USE ALONE: chunk is not related to any listed ethics or cultural concept"
 
 embedding:
   model: "BAAI/bge-m3"
@@ -73,6 +108,11 @@ inference:
   max_tokens: 64                       # output is JSON like {"labels":["a","b"]}
   threshold_score: 0.30                # cosine threshold; below -> dropped from candidates
   max_labels_per_chunk: 5
+  # Pre-filter heuristic: book front-matter, copyright pages, TOCs, reference
+  # lists, table fragments etc. get assigned ["other"] directly without going
+  # through bge-m3 / vLLM. Major quality + latency win on PDF-OCR corpora.
+  # Set to false to send EVERY chunk through the LLM.
+  skip_boilerplate: true
 
 io:
   flush_every_records: 500

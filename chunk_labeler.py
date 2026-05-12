@@ -22,6 +22,80 @@ from typing import Dict, List, Optional
 OTHER = "other"
 
 
+# ---------------- boilerplate pre-filter ----------------
+#
+# OCR'd PDF corpora carry a lot of non-content chunks (copyright pages, tables of
+# contents, reference lists, HTML/MD table fragments, running headers). bge-m3 will
+# still pick top-K candidate labels for these, and the LLM, forced to choose one
+# from a constrained enum, ends up assigning plausible-but-wrong ethics labels
+# (e.g. a TOC line "Ritual 35  The Gentleman 42" -> "ritual").
+#
+# This heuristic catches the clearest cases and short-circuits them to ["other"]
+# without invoking embedder or LLM. Conservative by design — when ambiguous we
+# let the LLM decide.
+
+_BOILERPLATE_PATTERNS = [
+    # English book front-matter / legal
+    re.compile(r"all rights reserved", re.I),
+    re.compile(r"copyright\s*[©(]|©\s*\d{4}", re.I),
+    re.compile(r"\bISBN[- :]?\d", re.I),
+    re.compile(r"\bdoi[:\s]\s*10\.\d{4,9}", re.I),
+    re.compile(r"first published\s+\d{4}", re.I),
+    re.compile(r"this edition first published", re.I),
+    re.compile(r"\bpublished by\b.*\b(press|publisher|publishing)\b", re.I),
+    re.compile(r"library of congress cataloging", re.I),
+    # Chinese book front-matter
+    re.compile(r"图书在版编目|版权所有|不得翻印|印张|开本"),
+    re.compile(r"出版社\s*[:：]"),
+    re.compile(r"^\s*目\s*录\s*$", re.M),
+    # HTML / Markdown table fragments
+    re.compile(r"</?(td|tr|th|table)[> ]", re.I),
+]
+
+
+def _looks_like_toc(text: str) -> bool:
+    """A run of `<title> ... <page-number>` lines -> table of contents."""
+    lines = [l.rstrip() for l in text.splitlines() if l.strip()]
+    if len(lines) < 5:
+        return False
+    toc_like = sum(1 for l in lines if re.search(r"\s\d{1,4}\s*$", l))
+    return toc_like / len(lines) >= 0.45
+
+
+def _looks_like_refs(text: str) -> bool:
+    """Reference list: many year-cites, page-cites, vol numbers per length."""
+    if len(text) >= 2000:
+        return False
+    hits = (
+        len(re.findall(r"\bpp?\.\s*\d", text))
+        + len(re.findall(r"\(\s*(?:19|20)\d{2}\s*\)", text))
+        + len(re.findall(r"\bvol\.\s*\d", text, re.I))
+        + len(re.findall(r"\bed\.,?\s", text))
+    )
+    return hits >= 4
+
+
+def is_boilerplate(text: str) -> bool:
+    """True if the chunk looks like non-content (front matter, refs, tables, etc).
+
+    Such chunks should bypass the LLM and be labeled ["other"] directly. Conservative:
+    only fires on clear patterns to avoid eating real ethics content.
+    """
+    if not text:
+        return True
+    s = text.strip()
+    if len(s) < 40:
+        return True
+    for pat in _BOILERPLATE_PATTERNS:
+        if pat.search(s):
+            return True
+    if _looks_like_toc(s):
+        return True
+    if _looks_like_refs(s):
+        return True
+    return False
+
+
 PROMPT_CHUNK_TMPL = """You are an ethics annotation expert for cross-cultural moral analysis.
 
 Decide which of the CANDIDATE LABELS apply to the TEXT. Be strict:

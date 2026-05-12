@@ -29,8 +29,10 @@ from data_loader import (
 from utils import setup_logger, dump_json, free_memory
 from embedding_filter import EmbeddingFilter
 from llm_engine import VLLMRunner
-from label_generator import build_ontology, LABEL_NAMING_SCHEMA
-from chunk_labeler import build_guided_schema, build_prompt, parse_labels, OTHER
+from label_generator import build_ontology, apply_seed_descriptions, LABEL_NAMING_SCHEMA
+from chunk_labeler import (
+    build_guided_schema, build_prompt, parse_labels, is_boilerplate, OTHER,
+)
 
 
 # ============ stage 1 ============
@@ -150,6 +152,7 @@ def run_stage1(cfg: dict, logger, embedder: EmbeddingFilter,
     src_xlsx      = cfg["paths"]["questions_xlsx"]
     qcol          = cfg["paths"].get("question_column", "question")
     labeled_xlsx  = os.path.join(out_dir, "question_labeled.xlsx")
+    seed_descs    = cfg["ontology"].get("seed_descriptions") or {}
 
     questions = load_questions(src_xlsx, qcol)
     logger.info(f"[stage1] loaded {len(questions)} questions from {src_xlsx}")
@@ -158,6 +161,11 @@ def run_stage1(cfg: dict, logger, embedder: EmbeddingFilter,
     if os.path.exists(onto_path):
         logger.info(f"[stage1] ontology already exists at {onto_path}; loading.")
         ontology = load_ontology(onto_path)
+        # refresh seed-label descriptions from current config (cross-tradition update)
+        if seed_descs:
+            apply_seed_descriptions(ontology, seed_descs)
+            dump_json(onto_path, ontology)
+            logger.info(f"[stage1] refreshed seed_descriptions on existing ontology")
     else:
         if not questions:
             logger.warning("[stage1] no questions found; ontology = seed labels only")
@@ -180,6 +188,7 @@ def run_stage1(cfg: dict, logger, embedder: EmbeddingFilter,
             target_labels=cfg["ontology"]["target_labels"],
             min_labels=cfg["ontology"]["min_labels"],
             max_labels=cfg["ontology"]["max_labels"],
+            seed_descriptions=seed_descs,
         )
         dump_json(onto_path, ontology)
         logger.info(f"[stage1] ontology -> {onto_path} "
@@ -243,6 +252,11 @@ def run_stage2(cfg: dict, logger, ontology: dict,
         ontology["descriptions"][OTHER] = (
             "USE ALONE: chunk is not related to any listed ethics or cultural concept"
         )
+    # Refresh cross-tradition seed descriptions from current config, so a stale
+    # ontology.json from before the config update still benefits from them.
+    seed_descs = cfg["ontology"].get("seed_descriptions") or {}
+    if seed_descs:
+        apply_seed_descriptions(ontology, seed_descs)
 
     # --- prepare embedder side: label matrix
     embedder.fit_labels(
@@ -260,11 +274,13 @@ def run_stage2(cfg: dict, logger, ontology: dict,
     max_lbl  = int(cfg["inference"]["max_labels_per_chunk"])
     max_chr  = int(cfg["inference"]["max_chunk_chars"])
     max_out  = int(cfg["inference"]["max_tokens"])
+    skip_bp  = bool(cfg["inference"].get("skip_boilerplate", True))
 
     resume_ids = load_resume_ids(labels_path)
     total      = count_chunks(chunk_paths)
     remaining  = total - len(resume_ids)
-    logger.info(f"[stage2] total={total} resume={len(resume_ids)} remaining={remaining}")
+    logger.info(f"[stage2] total={total} resume={len(resume_ids)} remaining={remaining} "
+                f"skip_boilerplate={skip_bp}")
     if remaining <= 0:
         logger.info("[stage2] nothing to do.")
         return
@@ -273,6 +289,7 @@ def run_stage2(cfg: dict, logger, ontology: dict,
     label_counts: dict = {l: 0 for l in ontology["labels"]}
     n_failed = 0
     n_done   = 0
+    n_boilerplate = 0
 
     fout = open(labels_path, "a", encoding="utf-8")
     ferr = open(failed_path, "a", encoding="utf-8")
@@ -282,15 +299,40 @@ def run_stage2(cfg: dict, logger, ontology: dict,
     t0 = time.time()
 
     def flush():
-        nonlocal n_failed, n_done
+        nonlocal n_failed, n_done, n_boilerplate
         if not buf:
             return
-        texts = [c["text"][:max_chr] for c in buf]
+
+        # Split off boilerplate (TOC/refs/copyright/tables) -> direct ["other"],
+        # bypassing both bge-m3 and the LLM. Major precision + latency win.
+        if skip_bp:
+            live: list = []
+            bp:   list = []
+            for c in buf:
+                (bp if is_boilerplate(c["text"]) else live).append(c)
+        else:
+            live, bp = list(buf), []
+
+        # write boilerplate first
+        for c in bp:
+            rec = {"chunk_id": c["chunk_id"], "labels": [OTHER]}
+            fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            label_counts[OTHER] = label_counts.get(OTHER, 0) + 1
+            n_done += 1
+            n_boilerplate += 1
+
+        if not live:
+            fout.flush()
+            pbar.update(len(buf))
+            buf.clear()
+            return
+
+        texts = [c["text"][:max_chr] for c in live]
         # bge-m3 top-K candidates
         topk = embedder.topk_for_texts(texts, k=top_k, threshold=thresh)
         # build prompts
         prompts = []
-        for c, (idxs, _scores) in zip(buf, topk):
+        for c, (idxs, _scores) in zip(live, topk):
             cands = [ontology["labels"][i] for i in idxs]
             if not cands:
                 cands = ontology["labels"][:top_k]
@@ -303,16 +345,18 @@ def run_stage2(cfg: dict, logger, ontology: dict,
             )
         except Exception as e:
             logger.exception(f"[stage2] vLLM batch failed: {e}")
-            for c in buf:
+            for c in live:
                 ferr.write(json.dumps(
                     {"chunk_id": c.get("chunk_id"), "error": str(e)},
                     ensure_ascii=False) + "\n")
-            n_failed += len(buf)
+            n_failed += len(live)
             ferr.flush()
+            fout.flush()
+            pbar.update(len(buf))
             buf.clear()
             return
 
-        for c, out in zip(buf, outs):
+        for c, out in zip(live, outs):
             labs = parse_labels(out, allowed, max_lbl)
             rec = {"chunk_id": c["chunk_id"], "labels": labs}
             fout.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -340,6 +384,7 @@ def run_stage2(cfg: dict, logger, ontology: dict,
     elapsed = time.time() - t0
     rate = (n_done / elapsed) if elapsed > 0 else 0.0
     logger.info(f"[stage2] done={n_done} failed={n_failed} "
+                f"boilerplate={n_boilerplate} "
                 f"elapsed={elapsed:.1f}s rate={rate:.1f} chunks/s")
 
     stats = {
@@ -347,6 +392,7 @@ def run_stage2(cfg: dict, logger, ontology: dict,
         "resumed": len(resume_ids),
         "processed_this_run": n_done,
         "failed_this_run": n_failed,
+        "boilerplate_filtered": n_boilerplate,
         "ontology_size": len(ontology["labels"]),
         "elapsed_seconds": round(elapsed, 1),
         "chunks_per_second": round(rate, 2),

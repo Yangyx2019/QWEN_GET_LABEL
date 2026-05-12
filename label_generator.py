@@ -132,24 +132,51 @@ def merge_with_seeds(generated: List[str], seeds: List[str], max_labels: int) ->
 
 def build_label_descriptions(
     ontology: List[str], cluster_to_label: Dict[int, str], reps: Dict[int, List[str]],
+    seed_descriptions: Dict[str, str] = None,
 ) -> Dict[str, str]:
+    """Pick a description string for each label.
+
+    Priority:
+      1. `seed_descriptions[label]` if provided — used for SEED labels so their
+         meaning isn't pinned to the few English example questions that happened
+         to cluster there. Designed to stay tradition-agnostic across the corpus.
+      2. Concatenated cluster-representative questions (LLM-named novel labels).
+      3. Label name with underscores → spaces (last-resort fallback).
+    """
+    seed_descriptions = seed_descriptions or {}
     by_label: Dict[str, List[str]] = {}
     for c, lbl in cluster_to_label.items():
         by_label.setdefault(lbl, []).extend(reps.get(c, [])[:3])
     out: Dict[str, str] = {}
     for lbl in ontology:
+        if lbl in seed_descriptions and seed_descriptions[lbl]:
+            out[lbl] = seed_descriptions[lbl]
+            continue
         if lbl == "other":
-            # mandatory fallback: never embed-rank-friendly; described purely by purpose
             out[lbl] = "USE ALONE: chunk is not related to any listed ethics or cultural concept"
             continue
         examples = by_label.get(lbl, [])
         if examples:
-            # join up to 3 short example questions
             short = [e[:80] for e in examples[:3]]
             out[lbl] = " | ".join(short)
         else:
             out[lbl] = lbl.replace("_", " ")
     return out
+
+
+def apply_seed_descriptions(ontology: dict, seed_descriptions: Dict[str, str]) -> None:
+    """In-place override descriptions for seed labels in a loaded ontology.
+
+    Lets a previously-saved ontology.json pick up new cross-tradition descriptions
+    from config without rebuilding the ontology from scratch.
+    """
+    if not seed_descriptions:
+        return
+    ontology.setdefault("descriptions", {})
+    for lbl in ontology.get("labels", []):
+        new = seed_descriptions.get(lbl)
+        if new:
+            ontology["descriptions"][lbl] = new
 
 
 # ---------------- orchestrator ----------------
@@ -162,14 +189,19 @@ def build_ontology(
     target_labels: int = 30,
     min_labels: int = 20,
     max_labels: int = 50,
+    seed_descriptions: Dict[str, str] = None,
 ) -> dict:
     if not questions:
         # degenerate: ontology = seeds
         labels = [normalize_label(s) for s in seeds if s]
         labels = [x for x in labels if x]
+        descriptions = {
+            l: (seed_descriptions or {}).get(l, l.replace("_", " "))
+            for l in labels[:max_labels]
+        }
         return {
             "labels": labels[:max_labels],
-            "descriptions": {l: l.replace("_", " ") for l in labels[:max_labels]},
+            "descriptions": descriptions,
             "cluster_to_label": {},
             "n_questions": 0,
         }
@@ -205,7 +237,9 @@ def build_ontology(
             cluster_to_label[c] = lbl
 
     ontology = merge_with_seeds(generated, seeds, max_labels)
-    descriptions = build_label_descriptions(ontology, cluster_to_label, reps)
+    descriptions = build_label_descriptions(
+        ontology, cluster_to_label, reps, seed_descriptions=seed_descriptions,
+    )
 
     return {
         "labels": ontology,
