@@ -198,13 +198,18 @@ def build_prompt(text: str, candidates: List[str],
     else:
         raise ValueError(f"unknown mode: {mode!r} (expected 'chunk' or 'question')")
 
+    # We deliberately list ONLY label names, not descriptions. The LLM (Qwen-7B)
+    # already knows what concepts like `filial_piety`, `tyrannicide`, `face`, etc.
+    # mean; injecting an English example-bag description risks biasing it toward
+    # that specific example and is *worse than no description* when the cluster-
+    # derived description doesn't match the label's true concept (e.g. an old
+    # `vigilante_justice` description that actually described informing).
+    # Exception: the `other` fallback gets a one-line usage note so the LLM knows
+    # when to invoke it.
     lines = []
     for c in candidates:
-        d = (descriptions.get(c) or "").strip()
-        if c == OTHER and not d:
-            d = "USE ALONE when no other label applies"
-        if d:
-            lines.append(f"- {c}: {d}")
+        if c == OTHER:
+            lines.append(f"- {c}: USE ALONE when no other label applies")
         else:
             lines.append(f"- {c}")
     return tmpl.format(candidates="\n".join(lines), text=text)

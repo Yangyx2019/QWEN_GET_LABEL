@@ -27,21 +27,19 @@ of THIS cluster.
 Rules:
 - Output a single label only.
 - Format: snake_case English, 1 to 3 tokens
-  (e.g. filial_piety, bodily_autonomy, work_ethic, vigilante_justice, moral_luck,
-   counterfactual_ethics, animal_welfare, addiction_recovery).
+  (e.g. filial_piety, bodily_autonomy, work_ethic, moral_luck, animal_welfare).
 - Be SPECIFIC. Pick the label that most narrowly captures the cluster's theme.
   * cluster about skipping work / taking time off  -> work_ethic, not duty
-  * cluster about drug use / weed                 -> bodily_autonomy, not individual_rights
-  * cluster about time-travel / counterfactuals    -> moral_luck or counterfactual_ethics, not social_order
-  * cluster about giving away income to charity    -> charity or altruism, not duty
+  * cluster about drug use / weed                  -> bodily_autonomy, not individual_rights
+  * cluster about giving away income                -> charity, not duty
 - REUSE a SEED LABEL ONLY when it is a near-perfect semantic match for the cluster
-  as a whole. If only part of the cluster matches a seed, propose a NEW label that
-  fits the cluster better.
-- Forbidden behavior: do NOT default to `duty`, `harm`, `individual_rights`, or
-  `social_order` as catch-alls for clusters that have a more precise theme.
-- Avoid trivial topic words (e.g. "money", "school", "friend", "job").
-- Each cluster should ideally get a label different from neighboring clusters; if
-  multiple clusters share the SAME theme, only then reuse the same label.
+  AS A WHOLE. If only part of the cluster matches a seed, propose a NEW label.
+- Forbidden: do NOT default to `duty`, `harm`, `individual_rights`, or `social_order`
+  as catch-alls; do NOT default to `loyalty` for clusters that aren't centrally about
+  fidelity to a person/cause; do NOT use `vigilante_justice` for cluster about
+  informing/reporting (those are SNITCHING/reporting, not private justice); do NOT
+  use `bodily_autonomy` for cluster about theft/property to support family.
+- Avoid trivial topic words ("money", "school", "friend", "job").
 
 SEED LABELS (reuse only on near-perfect match; otherwise propose a NEW snake_case label):
 {seed_labels}
@@ -136,17 +134,19 @@ def build_label_descriptions(
 ) -> Dict[str, str]:
     """Pick a description string for each label.
 
+    Used ONLY as the bge-m3 anchor text in stage2 — the LLM prompt no longer
+    includes descriptions; LLM picks from bare label names. So description quality
+    only affects top-K candidate routing, not LLM disambiguation.
+
     Priority:
-      1. `seed_descriptions[label]` if provided — used for SEED labels so their
-         meaning isn't pinned to the few English example questions that happened
-         to cluster there. Designed to stay tradition-agnostic across the corpus.
-      2. Concatenated cluster-representative questions (LLM-named novel labels).
-      3. Label name with underscores → spaces (last-resort fallback).
+      1. `seed_descriptions[label]` — cross-tradition definition for the 21 seeds.
+      2. For LLM-named cluster labels: just the label name with underscores → spaces.
+         (Cluster-rep concatenation removed: it produced misleading anchors like
+         "vigilante_justice" being embedded as a description of police informants,
+         which biased bge-m3 routing in the wrong direction.)
+      3. "other" gets its mandatory fallback gloss.
     """
     seed_descriptions = seed_descriptions or {}
-    by_label: Dict[str, List[str]] = {}
-    for c, lbl in cluster_to_label.items():
-        by_label.setdefault(lbl, []).extend(reps.get(c, [])[:3])
     out: Dict[str, str] = {}
     for lbl in ontology:
         if lbl in seed_descriptions and seed_descriptions[lbl]:
@@ -155,12 +155,7 @@ def build_label_descriptions(
         if lbl == "other":
             out[lbl] = "USE ALONE: chunk is not related to any listed ethics or cultural concept"
             continue
-        examples = by_label.get(lbl, [])
-        if examples:
-            short = [e[:80] for e in examples[:3]]
-            out[lbl] = " | ".join(short)
-        else:
-            out[lbl] = lbl.replace("_", " ")
+        out[lbl] = lbl.replace("_", " ")
     return out
 
 
