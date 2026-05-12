@@ -24,6 +24,7 @@ from tqdm import tqdm
 
 from data_loader import (
     iter_chunks, count_chunks, load_questions, load_resume_ids, load_ontology,
+    resolve_chunk_paths,
 )
 from utils import setup_logger, dump_json, free_memory
 from embedding_filter import EmbeddingFilter
@@ -216,14 +217,20 @@ def run_stage1(cfg: dict, logger, embedder: EmbeddingFilter,
 
 def run_stage2(cfg: dict, logger, ontology: dict,
                embedder: EmbeddingFilter, runner: VLLMRunner) -> None:
-    chunks_path  = cfg["paths"]["chunks_jsonl"]
+    chunks_spec  = cfg["paths"]["chunks_jsonl"]
     out_dir      = cfg["paths"]["output_dir"]
     labels_path  = os.path.join(out_dir, "chunk_labels.jsonl")
     failed_path  = os.path.join(out_dir, "failed_chunks.jsonl")
     stats_path   = os.path.join(out_dir, "stats.json")
 
-    if not os.path.exists(chunks_path):
-        raise FileNotFoundError(f"chunks file not found: {chunks_path}")
+    chunk_paths = resolve_chunk_paths(chunks_spec)
+    missing = [p for p in chunk_paths if not os.path.exists(p)]
+    chunk_paths = [p for p in chunk_paths if os.path.exists(p)]
+    if not chunk_paths:
+        raise FileNotFoundError(f"no chunks files matched: {chunks_spec}")
+    if missing:
+        logger.warning(f"[stage2] skipping {len(missing)} missing path(s): {missing}")
+    logger.info(f"[stage2] inputs: {len(chunk_paths)} file(s): {chunk_paths}")
 
     # Backward-compat: ensure the `other` fallback label is in the ontology.
     # Old ontology.json files (pre-`other`) get migrated in-memory; new runs
@@ -255,7 +262,7 @@ def run_stage2(cfg: dict, logger, ontology: dict,
     max_out  = int(cfg["inference"]["max_tokens"])
 
     resume_ids = load_resume_ids(labels_path)
-    total      = count_chunks(chunks_path)
+    total      = count_chunks(chunk_paths)
     remaining  = total - len(resume_ids)
     logger.info(f"[stage2] total={total} resume={len(resume_ids)} remaining={remaining}")
     if remaining <= 0:
@@ -317,7 +324,7 @@ def run_stage2(cfg: dict, logger, ontology: dict,
         buf.clear()
 
     try:
-        for c in iter_chunks(chunks_path, resume_ids):
+        for c in iter_chunks(chunk_paths, resume_ids):
             buf.append(c)
             if len(buf) >= mega_bs:
                 flush()

@@ -1,5 +1,13 @@
 paths:
-  chunks_jsonl: "data/chunks.jsonl"
+  # chunks_jsonl accepts a single path, a glob pattern, or a list of paths/globs.
+  # Examples:
+  #   chunks_jsonl: "data/chunks.jsonl"
+  #   chunks_jsonl: "data/*.jsonl"
+  #   chunks_jsonl: "data/**/metadata.jsonl"
+  #   chunks_jsonl:
+  #     - "data/儒家.jsonl"
+  #     - "data/道家.jsonl"
+  chunks_jsonl: "data/*.jsonl"
   questions_xlsx: "data/question.xlsx"
   question_column: "question"          # column name; falls back to first column
   output_dir: "outputs"
